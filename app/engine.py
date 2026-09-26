@@ -452,23 +452,25 @@ class RuleEvaluation:
     suppressed: list[SuppressedSegment] = field(default_factory=list)
 
 
-def channel_held_intervals(
+def channel_sample_spans(
     events: list[Event],
     condition: Condition,
     horizon: float,
     ttl: float | None = None,
-) -> tuple[list[Interval], list[Event]]:
-    """Return ([start,end) intervals where the predicate held], witnessing events).
+) -> list[tuple[Event, Interval]]:
+    """Each sample paired with the half-open span its value is in effect.
 
-    A sample's value is held on ``[sample.ts, next_sample.ts)``; the last sample
-    is held through ``horizon`` (the timestamp of the newest event in the whole
-    dataset). Equal timestamps keep the last supplied value.
+    Returns ``(sample, span)`` pairs in sample order, covering exactly the
+    stretches where the (possibly latching) predicate holds: ``span`` is
+    ``[sample.ts, min(next_sample.ts, sample.ts + ttl, horizon))`` for the
+    samples whose held value keeps the condition true.  Equal timestamps keep
+    the last supplied value.
 
-    When ``ttl`` is a positive number of seconds, the hold is capped:
-    ``[sample.ts, min(next_sample.ts, sample.ts + ttl, horizon))``.  Whatever
-    remains after the cap is an *invalid gap* (no held value at all), so the
-    condition drops out of AND/OR combinations there and any truth interruption
-    makes the sustained duration re-accumulate from scratch.
+    When ``ttl`` is a positive number of seconds the hold is capped, and
+    whatever remains after the cap is an *invalid gap* (no held value at
+    all), so the condition drops out of AND/OR combinations there and any
+    truth interruption makes the sustained duration re-accumulate from
+    scratch.
 
     When the condition carries a ``reset_threshold`` the predicate becomes a
     latch evaluated in held-interval order: it first arms only on a value
@@ -490,8 +492,7 @@ def channel_held_intervals(
         else:
             ordered.append(ev)
 
-    held: list[Interval] = []
-    witnesses: list[Event] = []
+    spans: list[tuple[Event, Interval]] = []
     latched = False
     prev_end: float | None = None
     for i, ev in enumerate(ordered):
@@ -514,10 +515,26 @@ def channel_held_intervals(
         else:
             latched = compare(ev.value, condition.op, condition.threshold)
         if latched:
-            held.append(Interval(ev.ts, seg_end))
-            witnesses.append(ev)
+            spans.append((ev, Interval(ev.ts, seg_end)))
         prev_end = seg_end
-    return union(held), witnesses
+    return spans
+
+
+def channel_held_intervals(
+    events: list[Event],
+    condition: Condition,
+    horizon: float,
+    ttl: float | None = None,
+) -> tuple[list[Interval], list[Event]]:
+    """Return ([start,end) intervals where the predicate held], witnessing events).
+
+    Derived from :func:`channel_sample_spans`: the held intervals are the
+    merged (touching = continuous) per-sample spans, the witnesses are the
+    samples those spans belong to.  See that function for the hold / TTL /
+    latching semantics.
+    """
+    spans = channel_sample_spans(events, condition, horizon, ttl=ttl)
+    return union([iv for _, iv in spans]), [ev for ev, _ in spans]
 
 
 def _merge_or(per_condition: list[list[Interval]]) -> list[Interval]:
@@ -560,6 +577,16 @@ def evaluate_rule(
     start, so ``confirmed_at = segment.start + duration``) and clips trigger
     evidence so it never crosses a maintenance boundary.
 
+    Trigger evidence is attributed by each sample's **effective span** — its
+    held interval after the TTL cap and the maintenance subtraction.  A
+    sample witnesses a fault interval exactly while such a span overlaps it,
+    so a sample taken *before* the fault start whose value is still in effect
+    when the AND intersection begins (or that keeps holding past a
+    maintenance window's end) is kept as evidence, while a sample whose span
+    expired (TTL gap) or was subtracted away (maintenance) never witnesses
+    that stretch.  Each evidence item's ``held_intervals`` are clipped to the
+    fault's half-open ``[start, end)``, never crossing its boundaries.
+
     Returns the surviving fault intervals (length >= ``duration_required``)
     plus the suppressed segments: spans where the rule's truth was lost to
     maintenance, attributed per condition channel.  Each suppressed span is
@@ -594,18 +621,32 @@ def evaluate_rule(
 
     raw_held_per: list[list[Interval]] = []
     held_per: list[list[Interval]] = []
-    witnesses_per: list[list[Event]] = []
+    # Per condition, each witness sample paired with its *effective* spans:
+    # the pieces of its held interval that survive the maintenance
+    # subtraction (the TTL cap is already applied by channel_sample_spans).
+    # Evidence is attributed from these spans, so a pre-fault sample still in
+    # effect inside the fault is kept, while spans lost to a TTL gap or a
+    # maintenance window contribute nothing.
+    effective_spans_per: list[list[tuple[Event, Interval]]] = []
     for cond in conditions:
-        ivs, witnesses = channel_held_intervals(
+        spans = channel_sample_spans(
             events_by_channel.get(cond.channel, []),
             cond,
             horizon,
             ttl=ttl_by_channel.get(cond.channel),
         )
-        raw_held_per.append(ivs)
+        raw_held_per.append(union([iv for _, iv in spans]))
         maint = merged_by_device.get(str(cond.device))
-        held_per.append(subtract(ivs, maint) if maint else ivs)
-        witnesses_per.append(witnesses)
+        if maint:
+            effective = [
+                (ev, piece)
+                for ev, span in spans
+                for piece in subtract([span], maint)
+            ]
+        else:
+            effective = spans
+        effective_spans_per.append(effective)
+        held_per.append(union([iv for _, iv in effective]))
 
     # AND over channels that actually exist; a condition with no channel
     # data can never be satisfied.
@@ -651,19 +692,30 @@ def evaluate_rule(
     for iv in truth:
         if iv.end - iv.start + _EPS >= duration_required:
             evidence: list[EvidenceItem] = []
-            for cond, held, witnesses in zip(conditions, held_per, witnesses_per):
-                inside = [
-                    h
-                    for h in held
-                    if h.start < iv.end and h.end > iv.start
-                ]
-                inside_events = [
-                    ev
-                    for ev in witnesses
-                    if iv.start <= ev.ts < iv.end
-                ]
+            for cond, effective in zip(conditions, effective_spans_per):
+                # A sample witnesses this fault exactly while one of its
+                # effective spans overlaps [iv.start, iv.end); the reported
+                # held sub-intervals are those overlaps, clipped to the
+                # fault's half-open bounds.  Spans are emitted in sample
+                # order, so the scan can stop once it passes the fault end.
+                clipped: list[Interval] = []
+                inside_events: list[Event] = []
+                for ev, piece in effective:
+                    if piece.start >= iv.end:
+                        break
+                    lo = max(piece.start, iv.start)
+                    hi = min(piece.end, iv.end)
+                    if hi <= lo:
+                        continue
+                    clipped.append(Interval(lo, hi))
+                    if not inside_events or inside_events[-1] is not ev:
+                        inside_events.append(ev)
                 evidence.append(
-                    EvidenceItem(condition=cond, events=inside_events, held_intervals=inside)
+                    EvidenceItem(
+                        condition=cond,
+                        events=inside_events,
+                        held_intervals=union(clipped),
+                    )
                 )
             faults.append(
                 FaultInterval(
